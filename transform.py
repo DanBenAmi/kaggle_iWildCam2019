@@ -1,15 +1,19 @@
+import cv2
+
+
 class CLACHE:
     """
     ref: https://docs.opencv.org/3.1.0/d5/daf/tutorial_py_histogram_equalization.html
     """
+    def __init__(self):
+        self.clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(16, 16))
 
     def __call__(self, train_img):
         # Color balancing
-        temp_img = cv2.imread(train_img, cv2.IMREAD_COLOR)
-        img_lab = cv2.cvtColor(temp_img, cv2.COLOR_BGR2Lab)
+        img_lab = cv2.cvtColor(train_img, cv2.COLOR_BGR2Lab)
 
         l, a, b = cv2.split(img_lab)
-        img_l = clahe.apply(l)
+        img_l = self.clahe.apply(l)
         img_clahe = cv2.merge((img_l, a, b))
 
         return cv2.cvtColor(img_clahe, cv2.COLOR_Lab2BGR)
@@ -22,8 +26,7 @@ class SimpleWhiteBalancing:
         self.wb.setP(p)
 
     def __call__(self, train_img):
-        temp_img = cv2.imread(train_img, cv2.IMREAD_COLOR)
-        return self.wb.balanceWhite(temp_img)
+        return self.wb.balanceWhite(train_img)
 
 
 class WhiteBalancing:
@@ -32,8 +35,7 @@ class WhiteBalancing:
         self.wb.setSaturationThreshold(sat_threshold)
 
     def __call__(self, train_img):
-        temp_img = cv2.imread(train_img, cv2.IMREAD_COLOR)
-        return self.wb.balanceWhite(temp_img)
+        return self.wb.balanceWhite(train_img)
 
 
 class WhiteBalancing2:
@@ -42,5 +44,4 @@ class WhiteBalancing2:
         self.wb.setSaturationThreshold(sat_threshold)
 
     def __call__(self, train_img):
-        temp_img = cv2.imread(train_img, cv2.IMREAD_COLOR)
-        return self.wb.balanceWhite(temp_img)
+        return self.wb.balanceWhite(train_img)
