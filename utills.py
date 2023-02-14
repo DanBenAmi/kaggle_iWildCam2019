@@ -1,11 +1,10 @@
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-
+import sklearn
 from sklearn.model_selection import train_test_split
 import cv2
 from transform import CLACHE, SimpleWhiteBalancing, WhiteBalancing, WhiteBalancing2
-
 
 import os
 import torch
@@ -23,9 +22,13 @@ import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
 from torch.utils.data import DataLoader
 
-def calc_accuracy(outputs, labels):
+
+def calc_metric(outputs, labels):
     _, preds = torch.max(outputs, dim=1)
-    return torch.tensor(torch.sum(preds == labels).item() / len(preds))
+    acc = torch.tensor(torch.sum(preds == labels).item() / len(preds))
+    f1 = sklearn.metrics.f1_score(labels, preds, average='macro')
+    return acc, f1
+
 
 # @torch.no_grad()
 def evaluate(model, name, vl_loader):
@@ -34,6 +37,7 @@ def evaluate(model, name, vl_loader):
     accuracy and loss for each architecture depends on the mode.
     in mode='encoder', an autoencoder object must be supplied.
     """
+    losses_lst, acc_lst, f1_lst = np.array([]), np.array([]), np.array([])
     # model.eval()
     with torch.no_grad():
         outputs = []
@@ -41,15 +45,16 @@ def evaluate(model, name, vl_loader):
             images, labels = batch
             # Evaluation upon a NN architecture
             out = model.forward(images)
-            acc = calc_accuracy(out, labels)
+            acc, f1 = calc_metric(out, labels)
             loss = F.cross_entropy(out, labels)
 
-            outputs.append({'{}_loss'.format(name): loss.detach(), '{}_acc'.format(name): acc})
+            losses_lst = np.append(losses_lst, loss.item())
+            acc_lst = np.append(acc_lst, acc.item())
+            f1_lst = np.append(f1_lst, f1.item())
 
-    # average up the accuracy & loss upon all epochs
-    epoch_loss = torch.stack(list(map(lambda x: x['{}_loss'.format(name)], outputs))).mean()
-    epoch_acc = torch.stack(list(map(lambda x: x['{}_acc'.format(name)], outputs))).mean()
-    return {'{}_loss'.format(name): epoch_loss.item(), '{}_acc'.format(name): epoch_acc.item()}
+    return {'{}_loss'.format(name): losses_lst.mean(),
+            '{}_acc'.format(name): acc_lst.mean(),
+            '{}_f1'.format(name): f1_lst.mean()}
 
 
 def train_model(name, epochs, model, train_loader, val_loader, optimizer, scheduler=None):
@@ -78,7 +83,7 @@ def train_model(name, epochs, model, train_loader, val_loader, optimizer, schedu
             outputs = model.forward(images)
             train_loss = loss_func(outputs, labels)
 
-            train_accuracy = calc_accuracy(outputs, labels)
+            train_accuracy = calc_metric(outputs, labels)
             # History Tracking
             train_acc.append(train_accuracy)
             train_losses.append(train_loss)
@@ -97,8 +102,8 @@ def train_model(name, epochs, model, train_loader, val_loader, optimizer, schedu
         temp_loss = float(result['val_loss'])
         result['train_acc'] = torch.stack(train_acc).mean().item()
 
-        print("Epoch {}: train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f} ".format(
-            epoch + 1, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc']))
+        print("Epoch {}: train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}, val_f1: {:.4f} ".format(
+            epoch + 1, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc'], result['val_f1']))
 
         # if temp_acc > best_acc:
         #     best_acc = temp_acc
@@ -114,6 +119,7 @@ def get_default_device():
         return torch.device('cuda')
     else:
         return torch.device('cpu')
+
 
 device = get_default_device()
 
@@ -202,13 +208,14 @@ class ResNet(nn.Module):
 
 class two_CNN(nn.Module):
     '''This model have two CNN layes and two fully connected layes'''
+
     def __init__(self, n=100):
         super(two_CNN, self).__init__()
         self.n = n
-        self.conv1 = nn.Conv2d(in_channels=3, out_channels=self.n, kernel_size=5,  padding = int((5-1) / 2))
-        self.conv2 = nn.Conv2d(self.n, 2*self.n, kernel_size=5, padding = int((5-1) / 2))
-        self.fc1 = nn.Linear(7200*24, out_features = 20)
-        self.fc2 = nn.Linear(in_features = 20, out_features = 14)
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=self.n, kernel_size=5, padding=int((5 - 1) / 2))
+        self.conv2 = nn.Conv2d(self.n, 2 * self.n, kernel_size=5, padding=int((5 - 1) / 2))
+        self.fc1 = nn.Linear(7200 * 24, out_features=20)
+        self.fc2 = nn.Linear(in_features=20, out_features=14)
         self.name = "two_CNN"
 
     def forward(self, x, verbose=False):
@@ -218,7 +225,7 @@ class two_CNN(nn.Module):
 
         x = self.conv2(x)
         x = F.relu(x)
-        x = F.max_pool2d(x, kernel_size=5, stride =5)
+        x = F.max_pool2d(x, kernel_size=5, stride=5)
 
         x = torch.flatten(x)
 
