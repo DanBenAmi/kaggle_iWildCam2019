@@ -1,33 +1,23 @@
-import torch
+
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+
 import sklearn
-from sklearn.model_selection import train_test_split
-import cv2
-from transform import CLACHE, SimpleWhiteBalancing, WhiteBalancing, WhiteBalancing2
 
-import os
+
 import torch
-import torchvision
 
-from torch.utils.data import WeightedRandomSampler
 from torchvision import models
 import torch.nn as nn
-from torch.optim import lr_scheduler
 
 import numpy as np
-import pandas as pd
 
-import torchvision.transforms as transforms
-import matplotlib.pyplot as plt
-from torch.utils.data import DataLoader
 
 
 def calc_metric(outputs, labels):
     _, preds = torch.max(outputs, dim=1)
     acc = torch.tensor(torch.sum(preds == labels).item() / len(preds))
     f1 = sklearn.metrics.f1_score(labels, preds, average='macro')
-    return acc, f1
+    return acc.item(), f1
 
 
 # @torch.no_grad()
@@ -49,8 +39,8 @@ def evaluate(model, name, vl_loader):
             loss = F.cross_entropy(out, labels)
 
             losses_lst = np.append(losses_lst, loss.item())
-            acc_lst = np.append(acc_lst, acc.item())
-            f1_lst = np.append(f1_lst, f1.item())
+            acc_lst = np.append(acc_lst, acc)
+            f1_lst = np.append(f1_lst, f1)
 
     return {'{}_loss'.format(name): losses_lst.mean(),
             '{}_acc'.format(name): acc_lst.mean(),
@@ -73,6 +63,8 @@ def train_model(name, epochs, model, train_loader, val_loader, optimizer, schedu
         # Training Phase
         train_losses = []
         train_acc = []
+        train_f1 = []
+
         for batch in train_loader:
             images, labels = batch
 
@@ -83,10 +75,11 @@ def train_model(name, epochs, model, train_loader, val_loader, optimizer, schedu
             outputs = model.forward(images)
             train_loss = loss_func(outputs, labels)
 
-            train_accuracy = calc_metric(outputs, labels)
+            tr_acc, tr_f1 = calc_metric(outputs, labels)
             # History Tracking
-            train_acc.append(train_accuracy)
+            train_acc.append(tr_acc)
             train_losses.append(train_loss)
+            train_f1.append(tr_f1)
             # Backprop & update weights
             train_loss.backward()
             optimizer.step()
@@ -100,7 +93,7 @@ def train_model(name, epochs, model, train_loader, val_loader, optimizer, schedu
         result['train_loss'] = torch.stack(train_losses).mean().item()
         temp_acc = float(result['val_acc'])
         temp_loss = float(result['val_loss'])
-        result['train_acc'] = torch.stack(train_acc).mean().item()
+        result['train_acc'] = np.array(train_acc).mean().item()
 
         print("Epoch {}: train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}, val_f1: {:.4f} ".format(
             epoch + 1, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc'], result['val_f1']))

@@ -5,7 +5,6 @@
 from torch.utils.data import Dataset, DataLoader
 
 from sklearn.model_selection import train_test_split
-import cv2
 from transform import CLACHE, SimpleWhiteBalancing, WhiteBalancing, WhiteBalancing2
 
 from utills import *
@@ -30,7 +29,10 @@ from torch.utils.data import DataLoader
 # Custom data generator
 class WildDataset(Dataset):
     def __init__(self, df, img_dir, augs=None):
-        self.df = df[:24*8]
+
+
+        # self.df = df[df["file_name"].isin(os.listdir(r'/Users/elad.sofer/src/kaggle_iWildCam2019/input/train_test'))]
+        self.df = df
         self.img_dir = img_dir
         self.augs = augs
         self.sampler = self.make_sampler()
