@@ -46,7 +46,12 @@ class WildDataset(Dataset):
         x = df[df["category_new_id"] == 1]
         x = x[:len(x) // 5]
         self.df = pd.concat([x, df[df["category_new_id"] != 1]])
-
+        indices = np.arange(len(self.df))
+        np.random.shuffle(indices)
+        npdf = self.df.to_numpy()
+        npdf = npdf[indices]
+        self.df = pd.DataFrame(npdf, columns=self.df.columns)
+        # self.df = self.df.iloc[:10000,:]
         self.img_dir = img_dir
         self.augs = augs
         self.sampler = self.make_sampler()
@@ -70,49 +75,169 @@ class WildDataset(Dataset):
             image = self.augs(image)
         return image, label
 
+def get_default_device():
+    """Pick GPU if available, else CPU"""
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    else:
+        return torch.device('cpu')
 
-# Data path
-train_df_all = pd.read_csv('input/train.csv')
-test_df = pd.read_csv('input/test.csv')
-sub = pd.read_csv('input/sample_submission.csv')
-train_dir = 'input/train_images'
-test_dir = 'input/test_images'
-print('Total images for train {0}'.format(len(os.listdir(train_dir))))
-print('Total images for train {0}'.format(len(os.listdir(test_dir))))
 
-# code from https://www.kaggle.com/gpreda/iwildcam-2019-eda
-classes_wild = {0: 'empty', 1: 'deer', 2: 'moose', 3: 'squirrel', 4: 'rodent', 5: 'small_mammal',
-                6: 'elk', 7: 'pronghorn_antelope', 8: 'rabbit', 9: 'bighorn_sheep', 10: 'fox', 11: 'coyote',
-                12: 'black_bear', 13: 'raccoon', 14: 'skunk', 15: 'wolf', 16: 'bobcat', 17: 'cat',
-                18: 'dog', 19: 'opossum', 20: 'bison', 21: 'mountain_goat', 22: 'mountain_lion'}
+class DeviceDataLoader():
+    """Wrap a dataloader to move data to a device"""
 
-train_df_all['classes_wild'] = train_df_all['category_id'].apply(lambda cw: classes_wild[cw])
-# train_df_all.iloc[50:60]
+    def __init__(self, dl, device):
+        self.dl = dl
+        self.device = device
 
-# Category distribution
-class_hist = train_df_all['classes_wild'].value_counts()
-print(class_hist)
-plt.figure(figsize=(10, 5))
-class_hist.plot(kind='bar', title="Category distribution", )
-plt.show()
-print(f"Only {len(class_hist)} classes are presented in the train set")
+    def __iter__(self):
+        """Yield a batch of data after moving it to device"""
+        for b in self.dl:
+            yield to_device(b, self.device)
 
-"""As seen in the histogram we are witnessing here for a very imbalanced data, as the 'empty' class is far bigger than all other classes combined.
-Furthermore, even when ignoring the 'empty' class, the data is still very imbalanced between the classes And some classes are not even train set at all, i.e. only 14 out of 23 classes are presented in the train set.
+    def __len__(self):
+        """Number of batches"""
+        return len(self.dl)
 
-### Data Class Map
-"""
 
-# reduce Class Indices
-CLASSES_TO_USE = train_df_all['category_id'].unique()
-NUM_CLASSES = len(CLASSES_TO_USE)
-CLASSMAP = dict([(i, j) for i, j in zip(CLASSES_TO_USE, range(NUM_CLASSES))])
-REVERSE_CLASSMAP = dict([(v, k) for k, v in CLASSMAP.items()])
-print(CLASSMAP)
+def to_device(data, device):
+    """Move tensor(s) to chosen device"""
+    if isinstance(data, (list, tuple)):
+        return [to_device(x, device) for x in data]
+    return data.to(device, non_blocking=True)
 
-# define new id
-train_df_all['category_new_id'] = train_df_all['category_id'].map(CLASSMAP)
-train_df = train_df_all[['file_name', 'category_new_id']]
+
+def calc_metric(outputs, labels):
+    _, preds = torch.max(outputs, dim=1)
+    acc = torch.tensor(torch.sum(preds == labels).item() / len(preds))
+    f1 = sklearn.metrics.f1_score(labels.cpu(), preds.cpu(), average='macro')
+    return acc.item(), f1
+
+
+def evaluate(model, name, vl_loader, device='cpu'):
+    """
+    Evaluate a model upon a validation DataLoader, the function calculates the
+    accuracy and loss for each architecture depends on the mode.
+    in mode='encoder', an autoencoder object must be supplied.
+    """
+    losses_lst, acc_lst, f1_lst = np.array([]), np.array([]), np.array([])
+    # model.eval()
+    with torch.no_grad():
+        outputs = []
+        for b_idx, batch in enumerate(vl_loader):
+            # images, labels = batch[0].to(device), batch[1].to(device)
+            images, labels = batch[0].cuda(), batch[1].cuda()
+
+            print(f"batch number {b_idx}: evaluated  on {b_idx * len(labels)}/{len(vl_loader.dataset.df)} images ")
+            # Evaluation upon a NN architecture
+            out = model.forward(images)
+            acc, f1 = calc_metric(out, labels)
+            loss = F.cross_entropy(out, labels)
+
+            losses_lst = np.append(losses_lst, loss.item())
+            acc_lst = np.append(acc_lst, acc)
+            f1_lst = np.append(f1_lst, f1)
+
+    return {'{}_loss'.format(name): losses_lst.mean(),
+            '{}_acc'.format(name): acc_lst.mean(),
+            '{}_f1'.format(name): f1_lst.mean()}
+
+
+def train_model(name, epochs, model, train_loader, val_loader, optimizer, scheduler=None,
+                ckpts_dir='/content/drive/MyDrive/Colab Notebooks/stats_inference_project_ckpts', device='cpu'):
+    """
+    Train a model upon a train DataLoader, the function calculates the
+    accuracy and loss for each architecture depends on the mode.
+    in mode='encoder', an autoencoder object must be supplied.
+    """
+    history = []
+    best_f1 = 0
+    best_acc = 0
+    min_loss = 100
+    loss_func = F.cross_entropy
+
+    for epoch in range(epochs):
+        model.train()
+        # Training Phase
+        train_losses = []
+        train_acc = []
+        train_f1 = []
+
+        for b_idx, batch in enumerate(train_loader):
+            # images, labels = batch[0].to(device), batch[1].to(device)
+            images, labels = batch[0].cuda(), batch[1].cuda()
+
+            print(f"batch number {b_idx}: trained on {b_idx * len(labels)}/{len(train_loader.dataset.df)} images ")
+            # Cleanup
+            optimizer.zero_grad()
+
+            # Train a classic NN Model
+            outputs = model.forward(images)
+            train_loss = loss_func(outputs, labels)
+
+            tr_acc, tr_f1 = calc_metric(outputs, labels)
+            # History Tracking
+            train_acc.append(tr_acc)
+            train_losses.append(train_loss)
+            train_f1.append(tr_f1)
+            # Backprop & update weights
+            train_loss.backward()
+            optimizer.step()
+
+        # Learning rate decay
+        if scheduler:
+            scheduler.step()
+
+        # Finished an epoch, calculate the validation accuracy
+        result = evaluate(model, 'val', val_loader, device=device)  # results holds both train and val
+        result['train_loss'] = torch.stack(train_losses).mean().item()
+        result['train_acc'] = np.array(train_acc).mean().item()
+        result['train_f1'] = np.array(train_f1).mean().item()
+
+        print(
+            "Epoch {}: train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}, val_f1: {:.4f} ".format(
+                epoch + 1, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc'],
+                result['val_f1']))
+
+        if result['val_f1'] > best_f1:
+            best_f1 = result['val_f1']
+            torch.save(model, ckpts_dir + '/{}_trained_epoch-{}_f1-{:.4f}_date-{}.pt'.format(name, epoch, best_f1,
+                                                                                             date.today()))
+        elif result['val_acc'] > best_acc:
+            best_acc = result['val_acc']
+            torch.save(model, ckpts_dir + '/{}_trained_epoch-{}_f1-{:.4f}_date-{}.pt'.format(name, epoch, best_f1,
+                                                                                             date.today()))
+        history.append(result)
+
+    return history
+
+
+def create_confusion_matrix(model, data_loader, num_of_classes=6, norm_axis=1):
+    confusion_mat = np.zeros((len(classes), len(classes)))
+    for batch in data_loader:
+        images, labels_idx = batch
+
+        predications = model(images)
+        pred_labels = torch.argmax(predications, dim=1)
+        for pred, label in zip(pred_labels, labels_idx):
+            confusion_mat[label.item(), pred.item()] += 1
+
+    confusion_mat = confusion_mat / confusion_mat.sum(axis=norm_axis, keepdims=norm_axis)
+    return confusion_mat
+
+
+def plot_confusion_matrix(models, data_loader, num_of_classes=6, norm_axis=1):
+    for idx, (title, model) in enumerate(models.items()):
+        confusion_matrix = create_confusion_matrix(model, data_loader)
+
+        df_cm = pd.DataFrame(confusion_matrix,
+                             index=classes, columns=classes)
+
+        plt.figure(figsize=(12, 7))
+        plt.title('{}'.format(title));
+        ax = sn.heatmap(df_cm, annot=True)
+        ax.set(ylabel="Reference Label", xlabel="Predicted Label")
+
 
 """### Data Transforms"""
 
@@ -163,6 +288,104 @@ class WhiteBalancing2:
 
     def __call__(self, train_img):
         return self.wb.balanceWhite(train_img)
+
+
+class ResNet(nn.Module):
+    def __init__(self, base_model_name: str, pretrained=True,
+                 num_classes=14):
+        super().__init__()
+        base_model = models.__getattribute__(base_model_name)(
+            pretrained=pretrained)
+        layers = list(base_model.children())[:-2]
+        layers.append(nn.AdaptiveMaxPool2d(1))
+        self.encoder = nn.Sequential(*layers)
+
+        in_features = base_model.fc.in_features
+
+        self.classifier = nn.Sequential(
+            nn.Linear(in_features, 1024), nn.ReLU(), nn.Dropout(p=0.2),
+            nn.Linear(1024, 1024), nn.ReLU(), nn.Dropout(p=0.2),
+            nn.Linear(1024, num_classes))
+
+    def forward(self, x):
+        batch_size = x.size(0)
+        x = self.encoder(x).view(batch_size, -1)
+        x = self.classifier(x)
+        # multiclass_proba = F.softmax(x, dim=1)
+        # multilabel_proba = F.sigmoid(x)
+        # return {
+        #     "logits": x,
+        #     "multiclass_proba": multiclass_proba,
+        #     "multilabel_proba": multilabel_proba
+        # }
+        return x
+
+
+def plot_losses(histories):
+  for idx, (title, history) in enumerate(histories.items()):
+      plt.figure()
+      plt.plot(list(map(lambda x: x['val_loss'], history)), '-rx')
+      plt.plot(list(map(lambda x: x['train_loss'], history)), '-bo')
+      plt.legend(['Validation', 'Training'])
+      plt.xlabel('Epoch Number')
+      plt.ylabel('Loss')
+      plt.title('{}: Loss vs. #Epochs'.format(title));
+
+      sn.set_theme(style="whitegrid")
+      sn.set(rc={'figure.figsize':(14,7)})
+
+
+def plot_accuracies(histories):
+  for idx, (title, history) in enumerate(histories.items()):
+    plt.figure()
+    plt.plot([x['val_acc'] for x in history], '-rx')
+    plt.plot([x['train_acc'] for x in history], '-bo')
+    plt.legend(['Validation', 'Training'])
+    plt.xlabel('Epoch Number')
+    plt.ylabel('Accuracy')
+    plt.title('{}: Accuracy vs. #Epochs'.format(title));
+
+    sn.set_theme(style="whitegrid")
+    sn.set(rc={'figure.figsize':(14,7)})
+
+
+# Data path
+train_df_all = pd.read_csv('input/train.csv')
+test_df = pd.read_csv('input/test.csv')
+sub = pd.read_csv('input/sample_submission.csv')
+train_dir = 'input/train_images'
+test_dir = 'input/test_images'
+print('Total images for train {0}'.format(len(os.listdir(train_dir))))
+print('Total images for test {0}'.format(len(os.listdir(test_dir))))
+
+# code from https://www.kaggle.com/gpreda/iwildcam-2019-eda
+classes_wild = {0: 'empty', 1: 'deer', 2: 'moose', 3: 'squirrel', 4: 'rodent', 5: 'small_mammal',
+                6: 'elk', 7: 'pronghorn_antelope', 8: 'rabbit', 9: 'bighorn_sheep', 10: 'fox', 11: 'coyote',
+                12: 'black_bear', 13: 'raccoon', 14: 'skunk', 15: 'wolf', 16: 'bobcat', 17: 'cat',
+                18: 'dog', 19: 'opossum', 20: 'bison', 21: 'mountain_goat', 22: 'mountain_lion'}
+
+train_df_all['classes_wild'] = train_df_all['category_id'].apply(lambda cw: classes_wild[cw])
+# train_df_all.iloc[50:60]
+
+# Category distribution
+class_hist = train_df_all['classes_wild'].value_counts()
+# print(class_hist)
+# plt.figure(figsize=(10, 5))
+# class_hist.plot(kind='bar', title="Category distribution", )
+# plt.show()
+# print(f"Only {len(class_hist)} classes are presented in the train set")
+
+
+# reduce Class Indices
+CLASSES_TO_USE = train_df_all['category_id'].unique()
+NUM_CLASSES = len(CLASSES_TO_USE)
+CLASSMAP = dict([(i, j) for i, j in zip(CLASSES_TO_USE, range(NUM_CLASSES))])
+REVERSE_CLASSMAP = dict([(v, k) for k, v in CLASSMAP.items()])
+print(CLASSMAP)
+
+# define new id
+train_df_all['category_new_id'] = train_df_all['category_id'].map(CLASSMAP)
+train_df = train_df_all[['file_name', 'category_new_id']]
 
 
 aug = transforms.Compose([
@@ -216,299 +439,75 @@ val_loader = DataLoader(dataset=valid_set, batch_size=50, shuffle=False)
 """## Training and Evaluation Functions"""
 
 
-def get_default_device():
-    """Pick GPU if available, else CPU"""
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    else:
-        return torch.device('cpu')
-
-
-class DeviceDataLoader():
-    """Wrap a dataloader to move data to a device"""
-
-    def __init__(self, dl, device):
-        self.dl = dl
-        self.device = device
-
-    def __iter__(self):
-        """Yield a batch of data after moving it to device"""
-        for b in self.dl:
-            yield to_device(b, self.device)
-
-    def __len__(self):
-        """Number of batches"""
-        return len(self.dl)
-
-
-def to_device(data, device):
-    """Move tensor(s) to chosen device"""
-    if isinstance(data, (list, tuple)):
-        return [to_device(x, device) for x in data]
-    return data.to(device, non_blocking=True)
-
-
-def calc_metric(outputs, labels):
-    _, preds = torch.max(outputs, dim=1)
-    acc = torch.tensor(torch.sum(preds == labels).item() / len(preds))
-    f1 = sklearn.metrics.f1_score(labels.cpu(), preds.cpu(), average='macro')
-    return acc.item(), f1
-
-
-def evaluate(model, name, vl_loader):
-    """
-    Evaluate a model upon a validation DataLoader, the function calculates the
-    accuracy and loss for each architecture depends on the mode.
-    in mode='encoder', an autoencoder object must be supplied.
-    """
-    losses_lst, acc_lst, f1_lst = np.array([]), np.array([]), np.array([])
-    # model.eval()
-    with torch.no_grad():
-        outputs = []
-        for b_idx, batch in enumerate(vl_loader):
-            images, labels = to_device(batch, device)
-
-            print(f"batch number {b_idx}: evaluated  on {b_idx * len(labels)}/{len(vl_loader.dl.dataset.df)} images ")
-            # Evaluation upon a NN architecture
-            out = model.forward(images)
-            acc, f1 = calc_metric(out, labels)
-            loss = F.cross_entropy(out, labels)
-
-            losses_lst = np.append(losses_lst, loss.item())
-            acc_lst = np.append(acc_lst, acc)
-            f1_lst = np.append(f1_lst, f1)
-
-    return {'{}_loss'.format(name): losses_lst.mean(),
-            '{}_acc'.format(name): acc_lst.mean(),
-            '{}_f1'.format(name): f1_lst.mean()}
-
-
-def train_model(name, epochs, model, train_loader, val_loader, optimizer, scheduler=None,
-                ckpts_dir='/content/drive/MyDrive/Colab Notebooks/stats_inference_project_ckpts'):
-    """
-    Train a model upon a train DataLoader, the function calculates the
-    accuracy and loss for each architecture depends on the mode.
-    in mode='encoder', an autoencoder object must be supplied.
-    """
-    history = []
-    best_f1 = 0
-    best_acc = 0
-    min_loss = 100
-    loss_func = F.cross_entropy
-
-    for epoch in range(epochs):
-        model.train()
-        # Training Phase
-        train_losses = []
-        train_acc = []
-        train_f1 = []
-
-        for b_idx, batch in enumerate(train_loader):
-            images, labels = to_device(batch, device)
-
-            print(f"batch number {b_idx}: trained on {b_idx * len(labels)}/{len(train_loader.dl.dataset.df)} images ")
-            # Cleanup
-            optimizer.zero_grad()
-
-            # Train a classic NN Model
-            outputs = model.forward(images)
-            train_loss = loss_func(outputs, labels)
-
-            tr_acc, tr_f1 = calc_metric(outputs, labels)
-            # History Tracking
-            train_acc.append(tr_acc)
-            train_losses.append(train_loss)
-            train_f1.append(tr_f1)
-            # Backprop & update weights
-            train_loss.backward()
-            optimizer.step()
-
-        # Learning rate decay
-        if scheduler:
-            scheduler.step()
-
-        # Finished an epoch, calculate the validation accuracy
-        result = evaluate(model, 'val', val_loader)  # results holds both train and val
-        result['train_loss'] = torch.stack(train_losses).mean().item()
-        result['train_acc'] = np.array(train_acc).mean().item()
-        result['train_f1'] = np.array(train_f1).mean().item()
-
-        print(
-            "Epoch {}: train_loss: {:.4f}, train_acc: {:.4f}, val_loss: {:.4f}, val_acc: {:.4f}, val_f1: {:.4f} ".format(
-                epoch + 1, result['train_loss'], result['train_acc'], result['val_loss'], result['val_acc'],
-                result['val_f1']))
-
-        if result['val_f1'] > best_f1:
-            best_f1 = result['val_f1']
-            torch.save(model, ckpts_dir + '/{}_trained_epoch-{}_f1-{:.4f}_date-{}.pt'.format(name, epoch, best_f1,
-                                                                                             date.today()))
-        elif result['val_acc'] > best_acc:
-            best_acc = result['val_acc']
-            torch.save(model, ckpts_dir + '/{}_trained_epoch-{}_f1-{:.4f}_date-{}.pt'.format(name, epoch, best_f1,
-                                                                                             date.today()))
-        history.append(result)
-
-    return history
-
-
-def create_confusion_matrix(model, data_loader, num_of_classes=6, norm_axis=1):
-    confusion_mat = np.zeros((len(classes), len(classes)))
-    for batch in data_loader:
-        images, labels_idx = batch
-
-        predications = model(images)
-        pred_labels = torch.argmax(predications, dim=1)
-        for pred, label in zip(pred_labels, labels_idx):
-            confusion_mat[label.item(), pred.item()] += 1
-
-    confusion_mat = confusion_mat / confusion_mat.sum(axis=norm_axis, keepdims=norm_axis)
-    return confusion_mat
-
-
-def plot_confusion_matrix(models, data_loader, num_of_classes=6, norm_axis=1):
-    for idx, (title, model) in enumerate(models.items()):
-        confusion_matrix = create_confusion_matrix(model, data_loader)
-
-        df_cm = pd.DataFrame(confusion_matrix,
-                             index=classes, columns=classes)
-
-        plt.figure(figsize=(12, 7))
-        plt.title('{}'.format(title));
-        ax = sn.heatmap(df_cm, annot=True)
-        ax.set(ylabel="Reference Label", xlabel="Predicted Label")
-
 
 """## Model Trainings"""
-
-device = get_default_device()
-
-train_loader = DeviceDataLoader(train_loader, device)
-val_loader = DeviceDataLoader(val_loader, device)
-# test_dl = DeviceDataLoader(test_dl, device)
-
-# from google.colab import drive
-# drive.mount('/content/drive')
-
-# ckpts_dir = '/content/drive/MyDrive/Colab Notebooks/stats_inference_project_ckpts'
-
-"""### Resnet"""
-
-
-class ResNet(nn.Module):
-    def __init__(self, base_model_name: str, pretrained=True,
-                 num_classes=14):
-        super().__init__()
-        base_model = models.__getattribute__(base_model_name)(
-            pretrained=pretrained)
-        layers = list(base_model.children())[:-2]
-        layers.append(nn.AdaptiveMaxPool2d(1))
-        self.encoder = nn.Sequential(*layers)
-
-        in_features = base_model.fc.in_features
-
-        self.classifier = nn.Sequential(
-            nn.Linear(in_features, 1024), nn.ReLU(), nn.Dropout(p=0.2),
-            nn.Linear(1024, 1024), nn.ReLU(), nn.Dropout(p=0.2),
-            nn.Linear(1024, num_classes))
-
-    def forward(self, x):
-        batch_size = x.size(0)
-        x = self.encoder(x).view(batch_size, -1)
-        x = self.classifier(x)
-        # multiclass_proba = F.softmax(x, dim=1)
-        # multilabel_proba = F.sigmoid(x)
-        # return {
-        #     "logits": x,
-        #     "multiclass_proba": multiclass_proba,
-        #     "multilabel_proba": multilabel_proba
-        # }
-        return x
-
-
-num_epochs = 3
-lr = 10e-5
+# if torch.cuda.is_available():
+#     device = torch.device('cuda:0')
+#     print("GPU is available")
+# else:
+#     device = torch.device('cpu')
+#     print("GPU is not available")
+num_epochs = 15
+lr = 100e-5
 
 ckpts_dir = 'ckpts'
-model_fixed = to_device(ResNet(base_model_name='resnet50', num_classes=len(CLASSES_TO_USE)), device)
-optimizer = torch.optim.Adam(model_fixed.parameters(), lr)
-exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+# resnet = ResNet(base_model_name='resnet50', num_classes=len(CLASSES_TO_USE))
+# # resnet.to(device)
+# resnet.cuda()
+# optimizer = torch.optim.Adam(resnet.parameters(), lr)
+# exp_lr_scheduler = lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+#
+# history_ResNet_FT = train_model(name='resnet50', epochs=num_epochs,
+#                                 model=resnet, train_loader=train_loader,
+#                                 val_loader=val_loader,
+#                                 optimizer=optimizer, scheduler=exp_lr_scheduler, ckpts_dir=ckpts_dir)#, device=device)
+#
+# with open(f"{ckpts_dir}/history_ResNet_FT_{date.today()}.pkl", 'wb') as fp:
+#     pickle.dump(history_ResNet_FT, fp)
+#     print('dictionary saved successfully to file')
 
-history_ResNet_FT = train_model(name='model_ft', epochs=num_epochs,
-                                model=model_fixed, train_loader=train_loader,
-                                val_loader=val_loader,
-                                optimizer=optimizer, scheduler=exp_lr_scheduler, ckpts_dir=ckpts_dir)
-
-with open(f"{ckpts_dir}/history_ResNet_FT_{date.today()}.pkl", 'wb') as fp:
-    pickle.dump(history_ResNet_FT, fp)
-    print('dictionary saved successfully to file')
-
-def plot_losses(histories):
-  for idx, (title, history) in enumerate(histories.items()):
-      plt.figure()
-      plt.plot(list(map(lambda x: x['val_loss'], history)), '-rx')
-      plt.plot(list(map(lambda x: x['train_loss'], history)), '-bo')
-      plt.legend(['Validation', 'Training'])
-      plt.xlabel('Epoch Number')
-      plt.ylabel('Loss')
-      plt.title('{}: Loss vs. #Epochs'.format(title));
-
-      sn.set_theme(style="whitegrid")
-      sn.set(rc={'figure.figsize':(14,7)})
-
-def plot_accuracies(histories):
-  for idx, (title, history) in enumerate(histories.items()):
-    plt.figure()
-    plt.plot([x['val_acc'] for x in history], '-rx')
-    plt.plot([x['train_acc'] for x in history], '-bo')
-    plt.legend(['Validation', 'Training'])
-    plt.xlabel('Epoch Number')
-    plt.ylabel('Accuracy')
-    plt.title('{}: Accuracy vs. #Epochs'.format(title));
-
-    sn.set_theme(style="whitegrid")
-    sn.set(rc={'figure.figsize':(14,7)})
 
 # """###ViT
 #
 # https://www.kaggle.com/code/carlosaguayo/simple-huggingface-vit
 #
 # """
-#
-# from transformers import AutoModelForImageClassification, AutoFeatureExtractor, TrainingArguments, Trainer
-#
-# label2id = REVERSE_CLASSMAP
-# id2label = CLASSES_MAP
-# model_checkpoint = "microsoft/swin-tiny-patch4-window7-224" # pre-trained model from which to fine-tune
-#
-#
-# model = AutoModelForImageClassification.from_pretrained(
-#     model_checkpoint,
-#     label2id=label2id,
-#     id2label=id2label,
-#     ignore_mismatched_sizes = True, # provide this in case you're planning to fine-tune an already fine-tuned checkpoint
-# )
-#
-# model_name = model_checkpoint.split("/")[-1]
-#
-# epochs = 3
-#
-# args = TrainingArguments(
-#     f"{model_name}-Wild",
-#     remove_unused_columns=False,
-#     evaluation_strategy = "epoch",
-#     save_strategy = "epoch",
-#     learning_rate=5e-5,
-#     per_device_train_batch_size=batch_size,
-#     gradient_accumulation_steps=4,
-#     per_device_eval_batch_size=batch_size,
-#     num_train_epochs=epochs,
-#     warmup_ratio=0.1,
-#     logging_steps=10,
-#     load_best_model_at_end=True,
-# #     metric_for_best_model="accuracy",
-#     metric_for_best_model="f1",
-#     push_to_hub=False,
-# )
+
+from transformers import AutoModelForImageClassification, AutoFeatureExtractor, TrainingArguments, Trainer
+
+label2id = REVERSE_CLASSMAP
+id2label = CLASSES_MAP
+model_checkpoint = "microsoft/swin-tiny-patch4-window7-224" # pre-trained model from which to fine-tune
+
+
+model = AutoModelForImageClassification.from_pretrained(
+    model_checkpoint,
+    label2id=label2id,
+    id2label=id2label,
+    ignore_mismatched_sizes = True, # provide this in case you're planning to fine-tune an already fine-tuned checkpoint
+)
+
+model_name = model_checkpoint.split("/")[-1]
+
+epochs = 3
+
+args = TrainingArguments(
+    f"{model_name}-Wild",
+    remove_unused_columns=False,
+    evaluation_strategy = "epoch",
+    save_strategy = "epoch",
+    learning_rate=5e-5,
+    per_device_train_batch_size=batch_size,
+    gradient_accumulation_steps=4,
+    per_device_eval_batch_size=batch_size,
+    num_train_epochs=epochs,
+    warmup_ratio=0.1,
+    logging_steps=10,
+    load_best_model_at_end=True,
+#     metric_for_best_model="accuracy",
+    metric_for_best_model="f1",
+    push_to_hub=False,
+)
 #
 # # the compute_metrics function takes a Named Tuple as input:
 # # predictions, which are the logits of the model as Numpy arrays,

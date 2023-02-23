@@ -440,7 +440,7 @@ if torch.cuda.is_available():
     print(f"cuda is available")
 
 ckpts_dir = 'datasize_loop'
-for i in range(0, 7):
+for i in range(5,6):
     ds_length = (2**i)*1000
 
     # iWildCam dataset
